@@ -1,0 +1,1082 @@
+import requests
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import time
+import seaborn as sns
+import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
+from rapidfuzz import fuzz
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from folium import Map, CircleMarker, LayerControl, FeatureGroup
+import folium
+from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score, mean_squared_error
+import pandas as pd, re, unicodedata
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.impute import KNNImputer
+import scipy.stats as stats
+from sklearn.ensemble import RandomForestClassifier
+import scikit_posthocs as sp
+from sklearn.metrics import precision_recall_curve, f1_score
+from sklearn.preprocessing import RobustScaler
+import optuna
+from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.metrics import precision_recall_curve, f1_score, classification_report, confusion_matrix
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.inspection import PartialDependenceDisplay
+import shap
+import joblib
+
+df = pd.read_excel("data/train.xlsx")
+df = df.drop(index=19327) # 결측 많은 값 1개
+df[df['physical_strength'] == 65535] # 3개
+df = df.drop(index=[6000,11811,17598])
+df[df['low_section_speed'] == 65535] # 1개
+df = df.drop(index=[46546])
+list(df[df['Coolant_temperature'] == 1449].index) # 9개
+df = df.drop(index=list(df[df['Coolant_temperature'] == 1449].index))
+list(df[df['upper_mold_temp1'] == 1449].index) # 1개
+df = df.drop(index=list(df[df['upper_mold_temp1'] == 1449].index))
+list(df[df['upper_mold_temp2'] == 4232].index) # 1개
+df = df.drop(index=list(df[df['upper_mold_temp2'] == 4232].index))
+
+df['registration_time'] = pd.to_datetime(df['registration_time'])
+df['hour'] = df['registration_time'].dt.hour
+df['hour']=df['hour'].astype(object)
+
+
+df.columns
+df['tryshot_signal'] = df['tryshot_signal'].fillna('A')
+df['molten_volume'] = df['molten_volume'].fillna(0)
+condition = (df['molten_volume'].notna()) & (df['heating_furnace'].isna())
+df.loc[condition, 'heating_furnace'] = 'C'
+
+df["mold_code"] = df["mold_code"].astype(object)
+df["EMS_operation_time"] = df["EMS_operation_time"].astype(object)
+df.loc[df["molten_temp"] <= 80, "molten_temp"] = np.nan
+df.loc[df["physical_strength"] <= 5, "physical_strength"] = np.nan
+
+df = df.drop(columns=['id','line','name','mold_name','emergency_stop','time','date','registration_time',
+                      'upper_mold_temp3','lower_mold_temp3','working'])
+
+df.columns
+df['low_section_speed'].hist()
+np.sum(df['biscuit_thickness'] > 100)
+
+# 2. 입력변수(X), 타겟변수(y) 분리
+X = df.drop(columns=["passorfail"])
+y = df["passorfail"]
+
+split_point = int(len(df) * 0.8)
+X_train = X.iloc[:split_point]
+X_test = X.iloc[split_point:]
+y_train = y.iloc[:split_point]
+y_test = y.iloc[split_point:]
+
+# 4. 수치형 / 범주형 컬럼 구분
+num_cols = X_train.select_dtypes(include=["int64", "float64"]).columns
+cat_cols = X_train.select_dtypes(include=["object"]).columns
+
+# 5. 전처리 파이프라인 정의
+num_transformer = Pipeline(steps=[
+    ("imputer", KNNImputer(n_neighbors=5)),  # ✔️ 수치형 → KNN 기반 대치
+    ("scaler", RobustScaler())             # 표준화 스케일링
+])
+
+cat_transformer = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="most_frequent")), # 범주형 → 최빈값 대치
+    ("onehot", OneHotEncoder(handle_unknown="ignore"))    # Train에서 본 카테고리만 학습
+])
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("num", num_transformer, num_cols),
+        ("cat", cat_transformer, cat_cols)
+    ]
+)
+
+def objective(trial):
+    # 탐색할 파라미터 공간
+    n_estimators = trial.suggest_int("n_estimators", 100, 500, step=50)
+    max_depth = trial.suggest_int("max_depth", 3, 15)
+    min_samples_split = trial.suggest_int("min_samples_split", 2, 10)
+    min_samples_leaf = trial.suggest_int("min_samples_leaf", 1, 5)
+    max_features = trial.suggest_categorical("max_features", ["sqrt", "log2", None])
+
+    # 모델 정의
+    rf = RandomForestClassifier(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        min_samples_split=min_samples_split,
+        min_samples_leaf=min_samples_leaf,
+        max_features=max_features,
+        class_weight="balanced",
+        random_state=42,
+        n_jobs=-1
+    )
+
+    # 파이프라인 (전처리 + 모델)
+    clf = Pipeline(steps=[
+        ("preprocessor", preprocessor),
+        ("classifier", rf)
+    ])
+
+    # 교차 검증 F1 점수 계산
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    preds = cross_val_predict(clf, X_train, y_train, cv=cv, method="predict_proba")[:, 1]
+
+    # threshold = 0.5 기준에서 F1-score 계산
+    preds_bin = (preds >= 0.5).astype(int)
+    score = f1_score(y_train, preds_bin)
+
+    return score
+
+# -----------------------------
+# 2) Optuna 실행
+# -----------------------------
+study = optuna.create_study(direction="maximize")
+study.optimize(objective, n_trials=30)
+
+print("Best params:", study.best_params)
+print("Best CV F1:", study.best_value)
+
+# -----------------------------
+# 3) 최적 모델 학습
+# -----------------------------
+best_params = study.best_params
+rf_best = RandomForestClassifier(
+    **best_params,
+    class_weight="balanced",
+    random_state=42,
+    n_jobs=-1
+)
+
+clf_best = Pipeline(steps=[
+    ("preprocessor", preprocessor),
+    ("classifier", rf_best)
+])
+
+clf_best.fit(X_train, y_train)
+
+# -----------------------------
+# 4) 최적 threshold 탐색
+# -----------------------------
+# 예측 확률
+y_proba = clf_best.predict_proba(X_test)[:, 1]
+
+# Precision-Recall 곡선 계산
+precisions, recalls, thresholds = precision_recall_curve(y_test, y_proba)
+
+# 조건: Precision ≥ 0.8
+precision_threshold = 0.8
+
+valid_idx = np.where(precisions >= precision_threshold)[0]
+
+if len(valid_idx) > 0:
+    # 조건을 만족하는 threshold 중 Recall이 최대인 지점 선택
+    best_idx = valid_idx[np.argmax(recalls[valid_idx])]
+    best_threshold = thresholds[best_idx]
+    best_precision = precisions[best_idx]
+    best_recall = recalls[best_idx]
+    print(f"조건 충족 threshold = {best_threshold:.3f}, Precision = {best_precision:.3f}, Recall = {best_recall:.3f}")
+else:
+    print("⚠️ Precision 조건을 만족하는 threshold가 없음")
+
+
+# 같은 파라미터 threshold로 smote 방식 적용
+
+# 선택된 threshold로 최종 예측 생성
+y_pred_opt = (y_proba >= best_threshold).astype(int)
+
+# Confusion Matrix
+print("\nConfusion Matrix:\n", confusion_matrix(y_test, y_pred_opt))
+
+# Classification Report
+print("\nClassification Report:\n", classification_report(y_test, y_pred_opt))
+
+
+
+# SMOTE 방식
+from imblearn.over_sampling import SMOTE
+from imblearn.pipeline import Pipeline as ImbPipeline
+df = pd.read_excel("data/train.xlsx")
+df = df.drop(index=19327) # 결측 많은 값 1개
+df[df['physical_strength'] == 65535] # 3개
+df = df.drop(index=[6000,11811,17598])
+df[df['low_section_speed'] == 65535] # 1개
+df = df.drop(index=[46546])
+list(df[df['Coolant_temperature'] == 1449].index) # 9개
+df = df.drop(index=list(df[df['Coolant_temperature'] == 1449].index))
+list(df[df['upper_mold_temp1'] == 1449].index) # 1개
+df = df.drop(index=list(df[df['upper_mold_temp1'] == 1449].index))
+list(df[df['upper_mold_temp2'] == 4232].index) # 1개
+df = df.drop(index=list(df[df['upper_mold_temp2'] == 4232].index))
+
+df['registration_time'] = pd.to_datetime(df['registration_time'])
+df['hour'] = df['registration_time'].dt.hour
+df['hour']=df['hour'].astype(object)
+
+
+df.columns
+df['tryshot_signal'] = df['tryshot_signal'].fillna('A')
+df['molten_volume'] = df['molten_volume'].fillna(0)
+condition = (df['molten_volume'].notna()) & (df['heating_furnace'].isna())
+df.loc[condition, 'heating_furnace'] = 'C'
+
+df["mold_code"] = df["mold_code"].astype(object)
+df["EMS_operation_time"] = df["EMS_operation_time"].astype(object)
+df.loc[df["molten_temp"] <= 80, "molten_temp"] = np.nan
+df.loc[df["physical_strength"] <= 5, "physical_strength"] = np.nan
+
+df = df.drop(columns=['id','line','name','mold_name','emergency_stop','time','date','registration_time',
+                      'upper_mold_temp3','lower_mold_temp3','working'])
+# -----------------------------
+# 1) 입력변수(X), 타겟변수(y) 분리
+# -----------------------------
+X = df.drop(columns=["passorfail"])
+y = df["passorfail"]
+
+split_point = int(len(df) * 0.8)
+X_train = X.iloc[:split_point]
+X_test = X.iloc[split_point:]
+y_train = y.iloc[:split_point]
+y_test = y.iloc[split_point:]
+
+# -----------------------------
+# 2) 수치형 / 범주형 컬럼 구분
+# -----------------------------
+num_cols = X_train.select_dtypes(include=["int64", "float64"]).columns
+cat_cols = X_train.select_dtypes(include=["object"]).columns
+
+# 전처리 파이프라인
+num_transformer = Pipeline(steps=[
+    ("imputer", KNNImputer(n_neighbors=5)),
+    ("scaler", RobustScaler())
+])
+
+cat_transformer = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("onehot", OneHotEncoder(handle_unknown="ignore"))
+])
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("num", num_transformer, num_cols),
+        ("cat", cat_transformer, cat_cols)
+    ]
+)
+
+# -----------------------------
+# 3) Optuna 목적 함수 정의
+# -----------------------------
+def objective(trial):
+    n_estimators = trial.suggest_int("n_estimators", 100, 500, step=50)
+    max_depth = trial.suggest_int("max_depth", 3, 15)
+    min_samples_split = trial.suggest_int("min_samples_split", 2, 10)
+    min_samples_leaf = trial.suggest_int("min_samples_leaf", 1, 5)
+    max_features = trial.suggest_categorical("max_features", ["sqrt", "log2", None])
+
+    rf = RandomForestClassifier(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        min_samples_split=min_samples_split,
+        min_samples_leaf=min_samples_leaf,
+        max_features=max_features,
+        random_state=42,
+        n_jobs=-1
+    )
+
+    clf = ImbPipeline(steps=[
+        ("preprocessor", preprocessor),
+        ("smote", SMOTE(random_state=42)),
+        ("classifier", rf)
+    ])
+
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    preds = cross_val_predict(clf, X_train, y_train, cv=cv, method="predict_proba")[:, 1]
+
+    preds_bin = (preds >= 0.5).astype(int)
+    score = f1_score(y_train, preds_bin)
+
+    return score
+
+# -----------------------------
+# 4) Optuna 실행
+# -----------------------------
+study = optuna.create_study(direction="maximize")
+study.optimize(objective, n_trials=30)
+
+print("Best params:", study.best_params)
+print("Best CV F1:", study.best_value)
+
+# -----------------------------
+# 5) 최적 모델 학습 (SMOTE 포함)
+# -----------------------------
+best_params = study.best_params
+rf_best = RandomForestClassifier(
+    **best_params,
+    random_state=42,
+    n_jobs=-1
+)
+
+clf_best = ImbPipeline(steps=[
+    ("preprocessor", preprocessor),
+    ("smote", SMOTE(random_state=42)),
+    ("classifier", rf_best)
+])
+
+clf_best.fit(X_train, y_train)
+
+# -----------------------------
+# 6) 최적 threshold 탐색 (Precision 조건)
+# -----------------------------
+y_proba = clf_best.predict_proba(X_test)[:, 1]
+
+precisions, recalls, thresholds = precision_recall_curve(y_test, y_proba)
+
+# Precision 하한선
+precision_threshold = 0.8
+valid_idx = np.where(precisions >= precision_threshold)[0]
+
+if len(valid_idx) > 0:
+    best_idx = valid_idx[np.argmax(recalls[valid_idx])]
+    best_threshold = thresholds[best_idx]
+    best_precision = precisions[best_idx]
+    best_recall = recalls[best_idx]
+    print(f"조건 충족 threshold = {best_threshold:.3f}, Precision = {best_precision:.3f}, Recall = {best_recall:.3f}")
+    
+    # 최종 예측
+    y_pred_opt = (y_proba >= best_threshold).astype(int)
+
+    print("\nConfusion Matrix:\n", confusion_matrix(y_test, y_pred_opt))
+    print("\nClassification Report:\n", classification_report(y_test, y_pred_opt))
+else:
+    print("⚠️ Precision 조건을 만족하는 threshold가 없음")
+
+
+# Logistic Regression
+df = pd.read_excel("data/train.xlsx")
+# 이상치/결측 행 제거
+df = df.drop(index=19327) 
+df = df.drop(index=[6000,11811,17598]) 
+df = df.drop(index=[46546])
+df = df.drop(index=list(df[df['Coolant_temperature'] == 1449].index))
+df = df.drop(index=list(df[df['upper_mold_temp1'] == 1449].index))
+df = df.drop(index=list(df[df['upper_mold_temp2'] == 4232].index))
+
+# 시간 변수 가공
+df['registration_time'] = pd.to_datetime(df['registration_time'])
+df['hour'] = df['registration_time'].dt.hour.astype(object)
+
+# 결측치 보정
+df['tryshot_signal'] = df['tryshot_signal'].fillna('A')
+df['molten_volume'] = df['molten_volume'].fillna(0)
+condition = (df['molten_volume'].notna()) & (df['heating_furnace'].isna())
+df.loc[condition, 'heating_furnace'] = 'C'
+
+# 타입 변경
+df["mold_code"] = df["mold_code"].astype(object)
+df["EMS_operation_time"] = df["EMS_operation_time"].astype(object)
+
+# 값 조건 기반 결측 처리
+df.loc[df["molten_temp"] <= 80, "molten_temp"] = np.nan
+df.loc[df["physical_strength"] <= 5, "physical_strength"] = np.nan
+
+# 불필요한 컬럼 제거
+df = df.drop(columns=[
+    'id','line','name','mold_name','emergency_stop','time','date','registration_time',
+    'upper_mold_temp3','lower_mold_temp3','working'
+])
+df.info()
+# -------------------
+# 1) X, y 분리
+# -------------------
+y = df['passorfail']
+X = df.drop(columns=['passorfail'])
+
+# 시간 순서 기준으로 split 
+split_point = int(len(df) * 0.8)
+X_train, X_test = X.iloc[:split_point], X.iloc[split_point:]
+y_train, y_test = y.iloc[:split_point], y.iloc[split_point:]
+
+# 4. 수치형 / 범주형 컬럼 구분
+num_cols = X_train.select_dtypes(include=["int64", "float64"]).columns
+cat_cols = X_train.select_dtypes(include=["object"]).columns
+
+# 5. 전처리 파이프라인 정의
+num_transformer = Pipeline(steps=[
+    ("imputer", KNNImputer(n_neighbors=5)),  # ✔️ 수치형 → KNN 기반 대치
+    ("scaler", RobustScaler())             # 표준화 스케일링
+])
+
+cat_transformer = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="most_frequent")), # 범주형 → 최빈값 대치
+    ("onehot", OneHotEncoder(handle_unknown="ignore"))    # Train에서 본 카테고리만 학습
+])
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("num", num_transformer, num_cols),
+        ("cat", cat_transformer, cat_cols)
+    ]
+)
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import confusion_matrix, classification_report, roc_auc_score
+
+# 6. 로지스틱 회귀 모델 정의
+log_reg = LogisticRegression(
+    max_iter=1000,          # 반복 횟수 (수렴 보장)
+    class_weight="balanced", # 불균형 데이터 보정
+    solver="lbfgs",         # 다항/원핫 인코딩 지원
+    random_state=42
+)
+
+# 7. 전체 파이프라인 구성 (전처리 + 로지스틱 회귀)
+clf = Pipeline(steps=[
+    ("preprocessor", preprocessor),
+    ("classifier", log_reg)
+])
+
+# 8. 모델 학습
+clf.fit(X_train, y_train)
+
+# 9. 예측
+y_pred = clf.predict(X_test)
+y_proba = clf.predict_proba(X_test)[:, 1]
+
+# 10. 평가 지표 출력
+print("Confusion Matrix:\n", confusion_matrix(y_test, y_pred))
+print("\nClassification Report:\n", classification_report(y_test, y_pred))
+print("\nROC AUC:", roc_auc_score(y_test, y_proba))
+
+# 1. 로지스틱 회귀 모델 가져오기
+log_reg_model = clf.named_steps["classifier"]
+
+# 2. 전체 feature 이름 추출
+feature_names = clf.named_steps["preprocessor"].get_feature_names_out()
+
+# 3. 수치형 feature 이름만 추출
+num_feature_names = clf.named_steps["preprocessor"].transformers_[0][1] \
+                        .get_feature_names_out(num_cols)
+
+# 4. coef_와 매칭
+coefficients = log_reg_model.coef_[0]
+
+coef_df = pd.DataFrame({
+    "feature": feature_names,
+    "coefficient": coefficients
+})
+
+# 5. 수치형 변수만 필터링
+coef_num = coef_df[coef_df["feature"].str.startswith("num__")] \
+              .sort_values(by="coefficient", ascending=False)
+
+print(coef_num)
+coef_num['coefficient_abs']=np.abs(coef_num['coefficient'])
+coef_num.sort_values('coefficient_abs',ascending=False)
+
+
+# ----------------------------------
+# (A) PDP Plot (모든 변수에 대해)
+# ----------------------------------
+
+import pandas as pd
+import joblib
+import matplotlib.pyplot as plt
+from sklearn.inspection import PartialDependenceDisplay
+import warnings
+warnings.filterwarnings('ignore')
+
+# -----------------------------
+# 1. 데이터 & 모델 불러오기
+# -----------------------------0
+# df = pd.read_csv("data/train.csv", encoding="utf-8", low_memory=False)
+df = pd.read_excel("data/train.xlsx")
+clf = joblib.load("model.pkl")   # 파이프라인 전체 (전처리+모델)
+
+# 사용 변수 (원본 데이터 컬럼)
+feature_columns = [
+    "cast_pressure",
+    "count", 
+    "upper_mold_temp1",
+    "low_section_speed",
+    "lower_mold_temp2",
+    "high_section_speed",
+    "upper_mold_temp2",
+    "lower_mold_temp1",
+    "biscuit_thickness",
+    "sleeve_temperature"
+]
+
+X_original = df[feature_columns].dropna()
+
+# -----------------------------
+# 2. 전처리 + 모델 분리
+# -----------------------------
+preprocessor = clf.named_steps["preprocessor"]
+model = clf.named_steps["classifier"]
+
+# 전처리 적용 (PDP는 classifier input 공간에서 계산)
+X_transformed = preprocessor.transform(X_original)
+
+# 변환된 feature 이름 가져오기
+try:
+    transformed_feature_names = preprocessor.get_feature_names_out()
+except:
+    transformed_feature_names = [f"feature_{i}" for i in range(X_transformed.shape[1])]
+
+# -----------------------------
+# 3. PDP 그리기
+# -----------------------------
+
+plt.rc("font", family="Malgun Gothic")   # 맑은 고딕
+plt.rc("axes", unicode_minus=False)  # 마이너스(-) 기호 깨짐 방지
+
+import matplotlib.pyplot as plt
+from sklearn.inspection import PartialDependenceDisplay
+
+loaded_model = joblib.load("model.pkl")
+loaded_model['feature_names']
+
+# 2) PDP를 그리고 싶은 변수들 지정 (예시: 2개 변수)
+best_features = loaded_model['feature_names']
+
+features_to_plot = loaded_model['feature_names']
+# 3) PDP Plot
+fig, ax = plt.subplots(figsize=(20, 12))
+PartialDependenceDisplay.from_estimator(
+    estimator=loaded_model,             # 불러온 모델
+    X=X_train[best_features],           # 학습에 사용한 독립변수 데이터
+    features=features_to_plot,          # PDP 보고 싶은 변수 리스트
+    percentiles=(0.05, 0.95),           # 극단값 제외
+    ax=ax
+)
+
+X_train.info()
+plt.suptitle("Partial Dependence Plot", fontsize=16)
+plt.tight_layout()
+
+
+# 모델과 feature 리스트 분리
+loaded = joblib.load("model.pkl")
+loaded_model = loaded["model"]              # 실제 모델(Pipeline or Estimator)
+best_features = loaded["feature_names"]     # feature 이름 리스트
+
+# PDP 그리기
+fig, ax = plt.subplots(figsize=(20, 12))
+PartialDependenceDisplay.from_estimator(
+    estimator=loaded_model,             # ✅ 실제 모델 객체
+    X=X_train,           # 학습에 사용한 독립변수
+    features=["molten_volume", "physical_strength"],  # PDP 그릴 대상
+    percentiles=(0.05, 0.95),
+    ax=ax
+)
+
+plt.suptitle("Partial Dependence Plot", fontsize=16)
+plt.tight_layout()
+plt.show()
+
+
+
+# 1. 모델 불러오기
+clf_loaded = joblib.load("model.pkl")
+print(clf_loaded)
+
+# 2. feature 이름 확보
+if hasattr(clf_loaded, "named_steps") and "preprocessor" in clf_loaded.named_steps:
+    preprocessor = clf_loaded.named_steps["preprocessor"]
+    feature_names = preprocessor.get_feature_names_out()
+else:
+    feature_names = X_test.columns  # fallback (모델만 저장된 경우)
+
+print("Features:", feature_names)
+
+
+# ----------------------------------
+# (B) SHAP Value Plot (모든 변수에 대해)
+# ----------------------------------
+# 1) classifier 추출
+if hasattr(clf_loaded, "named_steps") and "classifier" in clf_loaded.named_steps:
+    model = clf_loaded.named_steps["classifier"]
+else:
+    model = clf_loaded
+
+# 2) X_test 전처리 (Pipeline이면 transform 필요)
+if hasattr(clf_loaded, "named_steps") and "preprocessor" in clf_loaded.named_steps:
+    X_transformed = preprocessor.transform(X_test)
+    X_transformed = pd.DataFrame(X_transformed, columns=feature_names)
+else:
+    X_transformed = X_test.copy()
+
+# 3) 샘플링 (속도 문제 방지)
+X_sample = X_transformed.sample(200, random_state=42)
+
+# 4) SHAP 해석
+explainer = shap.TreeExplainer(model)
+shap_values = explainer.shap_values(X_sample)
+
+# Summary plot (bar)
+shap.summary_plot(shap_values, X_sample, plot_type="bar")
+
+# Summary plot (dot scatter)
+shap.summary_plot(shap_values, X_sample)
+
+
+# Shap Force Plot
+
+clf_loaded = joblib.load("model.pkl")
+print(clf_loaded)
+
+# 1. 모델과 전처리기 가져오기
+preprocessor = clf_loaded.named_steps["preprocessor"]
+model = clf_loaded.named_steps["classifier"]
+
+# 2. 사용자 정의 샘플 (원본 feature 기준)
+custom_sample = pd.DataFrame([{
+    "molten_temp": 720,
+    "facility_operation_cycleTime": 35,
+    "production_cycletime": 42,
+    "tryshot_signal": "A",
+    "mold_code": "8412",
+    # 👉 실제 X_test에 있는 모든 변수 포함해야 함
+}])
+
+# 3. 전처리 적용
+X_custom = preprocessor.transform(custom_sample)
+X_custom = pd.DataFrame(X_custom, columns=preprocessor.get_feature_names_out())
+
+# 4. SHAP 값 계산
+explainer = shap.TreeExplainer(model)
+shap_values = explainer.shap_values(X_custom)
+
+# 5. Force plot 그리기
+shap.initjs()
+shap.force_plot(
+    explainer.expected_value,
+    shap_values[0, :],       # 첫 번째(유일한) 샘플
+    X_custom.iloc[0, :],
+    matplotlib=True
+)
+
+
+
+final_model = final_model = joblib.load("model.pkl")
+feature_names = final_model['feature_names']
+
+# 실제 모델 객체 추출 (일반적으로 'model' 또는 'estimator' 키에 저장됨)
+model = final_model['model']  # 또는 final_model['estimator']
+
+X_sample = X_train.sample(3000, random_state=42)  
+PartialDependenceDisplay.from_estimator(
+    model,  # 딕셔너리가 아닌 실제 모델 객체 사용
+    X_sample,
+    features=["upper_mold_temp2"],
+    feature_names=feature_names,
+    grid_resolution=20
+)
+plt.show()
+
+
+def calculate_vif(X):
+    vif_data = pd.DataFrame()
+    vif_data["feature"] = X.columns
+    vif_data["VIF"] = [
+        variance_inflation_factor(X.values, i)
+        for i in range(X.shape[1])
+    ]
+    return vif_data
+
+X_num = X_train[num_cols].fillna(X_train[num_cols].mean())
+
+# 단계적으로 VIF 줄이기
+threshold = 10
+while True:
+    vif = calculate_vif(X_num)
+    max_vif = vif["VIF"].max()
+    if max_vif > threshold:
+        drop_feature = vif.sort_values("VIF", ascending=False).iloc[0]["feature"]
+        print(f"제거: {drop_feature} (VIF={max_vif:.2f})")
+        X_num = X_num.drop(columns=[drop_feature])
+    else:
+        break
+
+print("최종 변수 목록:", X_num.columns.tolist())
+
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+
+X_num = X_train[num_cols].copy()
+
+# NaN 있으면 임시로 평균 대치 (VIF는 NaN 허용X)
+X_num = X_num.fillna(X_num.mean())
+
+# VIF 계산
+vif_data = pd.DataFrame()
+vif_data["feature"] = X_num.columns
+vif_data["VIF"] = [
+    variance_inflation_factor(X_num.values, i)
+    for i in range(X_num.shape[1])
+]
+
+print(vif_data.sort_values("VIF", ascending=False))
+
+plt.figure(figsize=(10,8))
+sns.heatmap(X_train[num_cols].corr(), annot=True, cmap="coolwarm")
+plt.show()
+
+
+
+corr_matrix = X_train[num_cols].corr()
+
+# 2. 절대값 0.5 이상인 값만 추출 (자기자신=1.0은 제외)
+high_corr = corr_matrix[(np.abs(corr_matrix) >= 0.5) & (corr_matrix != 1.0)]
+
+# 3. NaN 값 제거 (필요시)
+high_corr = high_corr.dropna(how="all").dropna(axis=1, how="all")
+
+print(high_corr)
+
+
+import optuna
+from sklearn.model_selection import cross_val_score, StratifiedKFold
+from sklearn.ensemble import RandomForestClassifier
+
+# 1) 목적 함수 정의
+def objective(trial):
+    # 튜닝할 하이퍼파라미터 공간 정의
+    n_estimators = trial.suggest_int("n_estimators", 100, 500, step=50)
+    max_depth = trial.suggest_int("max_depth", 3, 15)
+    min_samples_split = trial.suggest_int("min_samples_split", 2, 10)
+    min_samples_leaf = trial.suggest_int("min_samples_leaf", 1, 5)
+    max_features = trial.suggest_categorical("max_features", ["sqrt", "log2", None])
+
+    # 모델 정의
+    rf = RandomForestClassifier(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        min_samples_split=min_samples_split,
+        min_samples_leaf=min_samples_leaf,
+        max_features=max_features,
+        class_weight="balanced",
+        random_state=42,
+        n_jobs=-1
+    )
+
+    # 전체 파이프라인 구성 (전처리 + 모델)
+    clf = Pipeline(steps=[
+        ("preprocessor", preprocessor),
+        ("classifier", rf)
+    ])
+
+    # 교차검증 (Stratified KFold 사용)
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    scores = cross_val_score(clf, X_train, y_train, cv=cv, scoring="f1")
+
+    return scores.mean()
+
+# 2) Optuna 실행
+study = optuna.create_study(direction="maximize")
+study.optimize(objective, n_trials=30)
+
+# 3) 최적 하이퍼파라미터 출력
+print("Best params:", study.best_params)
+print("Best F1-score:", study.best_value)
+
+# 4) 최적 모델로 학습
+best_params = study.best_params
+rf_best = RandomForestClassifier(
+    **best_params,
+    class_weight="balanced",
+    random_state=42,
+    n_jobs=-1
+)
+
+clf_best = Pipeline(steps=[
+    ("preprocessor", preprocessor),
+    ("classifier", rf_best)
+])
+
+clf_best.fit(X_train, y_train)
+y_pred = clf_best.predict(X_test)
+
+print(confusion_matrix(y_test, y_pred))
+print(classification_report(y_test, y_pred))
+
+
+df = pd.read_excel("data/train.xlsx")
+# 이상치/결측 행 제거
+df = df.drop(index=19327) 
+df = df.drop(index=[6000,11811,17598]) 
+df = df.drop(index=[46546])
+df = df.drop(index=list(df[df['Coolant_temperature'] == 1449].index))
+df = df.drop(index=list(df[df['upper_mold_temp1'] == 1449].index))
+df = df.drop(index=list(df[df['upper_mold_temp2'] == 4232].index))
+
+# 시간 변수 가공
+df['registration_time'] = pd.to_datetime(df['registration_time'])
+df['hour'] = df['registration_time'].dt.hour.astype(object)
+
+# 결측치 보정
+df['tryshot_signal'] = df['tryshot_signal'].fillna('A')
+df['molten_volume'] = df['molten_volume'].fillna(0)
+condition = (df['molten_volume'].notna()) & (df['heating_furnace'].isna())
+df.loc[condition, 'heating_furnace'] = 'C'
+
+# 타입 변경
+df["mold_code"] = df["mold_code"].astype(object)
+df["EMS_operation_time"] = df["EMS_operation_time"].astype(object)
+
+# 값 조건 기반 결측 처리
+df.loc[df["molten_temp"] <= 80, "molten_temp"] = np.nan
+df.loc[df["physical_strength"] <= 5, "physical_strength"] = np.nan
+
+# 불필요한 컬럼 제거
+df = df.drop(columns=[
+    'id','line','name','mold_name','emergency_stop','time','date','registration_time',
+    'upper_mold_temp3','lower_mold_temp3','working'
+])
+df.info()
+
+(df['passorfail']==1).sum()/len(df) # 전체 불량률
+
+mold_defect = (
+    df.groupby("mold_code")["passorfail"]
+    .mean()  # 불량률(= 불량건수/전체건수)
+    .reset_index()
+    .rename(columns={"passorfail": "불량률"})
+)
+
+# 2) 불량률 내림차순 정렬
+mold_defect = mold_defect.sort_values("불량률", ascending=False)
+
+plt.figure(figsize=(10,6))
+sns.barplot(x="mold_code", y="불량률", data=mold_defect)  # Seaborn으로 막대그래프
+plt.xticks(rotation=45)   # Matplotlib으로 x축 글자 회전
+plt.ylabel("불량률")
+plt.title("mold_code별 불량률")
+plt.ylim(0.03, 0.06)           # y축 범위 0 ~ 30으로 제한
+plt.tight_layout()
+plt.show()
+
+
+
+
+# -----------------------------
+# 1) 모델 불러오기
+# -----------------------------
+final_model = joblib.load("final_model.pkl")
+feature_names = final_model['feature_names']
+pipeline = final_model['model']
+
+model = pipeline.named_steps['classifier']
+preprocessor = pipeline.named_steps['preprocessor']
+
+# -----------------------------
+# 2) 특정 mold_code 필터링
+# -----------------------------
+TARGET_MOLD = 8722
+
+df_seg = df[df["mold_code"] == TARGET_MOLD].copy()
+X_seg = df_seg[feature_names]  # 일단 전체 feature 사용
+y_seg = df_seg["passorfail"]
+
+# 불량률 출력
+defect_rate = y_seg.mean() * 100
+print(f"mold_code {TARGET_MOLD} 불량률: {defect_rate:.2f}%")
+print(f"전체 샘플 수: {len(df_seg)}개 (불량: {y_seg.sum()}개)")
+
+# -----------------------------
+# 3) SHAP 분석
+# -----------------------------
+# 전처리
+X_seg_transformed = preprocessor.transform(X_seg)
+
+# feature names 가져오기
+try:
+    transformed_feature_names = list(preprocessor.get_feature_names_out())
+except:
+    transformed_feature_names = 11
+
+# SHAP 계산
+explainer = shap.TreeExplainer(model)
+shap_values = explainer.shap_values(X_seg_transformed)
+
+# 이진 분류: class 1(불량) 선택
+shap_values_plot = shap_values[1] if isinstance(shap_values, list) else shap_values
+
+# -----------------------------
+# 4) TOP 10 변수만 시각화 (mold_code 제외)
+# -----------------------------
+TOP_N = 10
+
+# 평균 절댓값으로 중요도 계산
+shap_mean_abs = np.abs(shap_values_plot).mean(axis=0)
+
+# mold_code 관련 컬럼 인덱스 찾기
+mold_code_indices = [i for i, name in enumerate(transformed_feature_names) 
+                     if 'mold_code' in name.lower()]
+
+# mold_code 제외한 인덱스
+non_mold_indices = [i for i in range(len(transformed_feature_names)) 
+                    if i not in mold_code_indices]
+
+# mold_code 제외한 데이터
+shap_values_filtered = shap_values_plot[:, non_mold_indices]
+X_seg_filtered = X_seg_transformed[:, non_mold_indices]
+feature_names_filtered = [transformed_feature_names[i] for i in non_mold_indices]
+shap_mean_abs_filtered = shap_mean_abs[non_mold_indices]
+
+# 상위 N개 인덱스 (필터링된 데이터 기준)
+top_indices = np.argsort(shap_mean_abs_filtered)[-TOP_N:][::-1]
+
+# 필터링
+shap_values_top = shap_values_filtered[:, top_indices]
+X_seg_top = X_seg_filtered[:, top_indices]
+feature_names_top = [feature_names_filtered[i] for i in top_indices]
+
+# 시각화
+plt.figure(figsize=(10, 6))
+shap.summary_plot(shap_values_top, X_seg_top, 
+                  feature_names=feature_names_top, 
+                  plot_type="bar", show=False)
+plt.title(f"mold_code {TARGET_MOLD} - SHAP 변수 영향도 TOP {TOP_N}")
+plt.tight_layout()
+plt.show()
+
+
+
+# 결과 출력
+print(f"\n=== TOP {TOP_N} 불량 영향 변수 (mold_code 제외) ===")
+for i, idx in enumerate(top_indices):
+    print(f"{i+1}. {feature_names_filtered[idx]}: {shap_mean_abs_filtered[idx]:.4f}")
+
+
+# ========== 설정 ==========
+TARGET_MOLD = 8722
+TARGET_FEATURE = 'sleeve_temperature'   # 분석할 변수
+SAMPLE_SIZE = 3000                      # 샘플 수 (None이면 전체 사용)
+EPS = 0.001                             # 권장 구간 허용 오차 (PDP 최저치 + ε)
+GRID = 50                               # PDP 격자 수
+# ==========================
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import joblib
+from sklearn.inspection import PartialDependenceDisplay, partial_dependence
+
+# -----------------------------
+# 1. 모델 불러오기
+# -----------------------------
+final_model = joblib.load("final_model.pkl")
+feature_names = final_model['feature_names']
+pipeline = final_model['model']   # Pipeline(전처리+모델)
+
+# -----------------------------
+# 2. 특정 mold_code 필터링
+# -----------------------------
+df_seg = df[df["mold_code"] == TARGET_MOLD].copy()
+
+# 샘플링
+if SAMPLE_SIZE is not None and len(df_seg) > SAMPLE_SIZE:
+    total = len(df_seg)
+    df_seg = df_seg.sample(n=SAMPLE_SIZE, random_state=42)
+    print(f"샘플링: {SAMPLE_SIZE}개 사용 (세그먼트 전체 {total}개)")
+
+X_seg = df_seg[feature_names]
+y_seg = df_seg["passorfail"]
+
+print(f"mold_code {TARGET_MOLD} 샘플 수: {len(df_seg)}개")
+print(f"불량률: {y_seg.mean() * 100:.2f}%\n")
+
+# -----------------------------
+# 3. PDP + Actionable Insight
+# -----------------------------
+if TARGET_FEATURE not in feature_names:
+    print(f"[오류] '{TARGET_FEATURE}' 변수가 feature_names에 없습니다.")
+    print("사용 가능한 변수 목록 예시:", feature_names[:10], "...")
+else:
+    print(f"PDP 대상 변수: {TARGET_FEATURE}")
+
+    # 3-1) PDP 그래프 (기본 곡선)
+    display = PartialDependenceDisplay.from_estimator(
+        estimator=pipeline,
+        X=X_seg,
+        features=[TARGET_FEATURE],
+        kind='average',
+        grid_resolution=GRID,
+        response_method="predict_proba"
+    )
+    ax = display.axes_[0, 0]   # 실제 그려진 축을 가져옴
+
+    # 3-2) PDP 곡선 값 직접 추출
+    pd_res = partial_dependence(
+        estimator=pipeline,
+        X=X_seg,
+        features=[TARGET_FEATURE],
+        kind='average',
+        grid_resolution=GRID,
+        response_method="predict_proba"
+    )
+    xx = np.asarray(pd_res["grid_values"][0])  # x축 grid 값
+    yy = np.asarray(pd_res["average"][0])      # PDP 평균 곡선 값
+
+    # 3-3) 데이터 분포 기반 binning (표본 수 고려)
+    xvals = X_seg[TARGET_FEATURE].values
+    edges = np.r_[xx[0], (xx[1:] + xx[:-1]) / 2, xx[-1]]   # bin 경계
+    bin_ids = np.digitize(xvals, edges) - 1
+    bin_ids = np.clip(bin_ids, 0, len(xx)-1)
+    counts = np.bincount(bin_ids, minlength=len(xx))
+
+    # 최소 표본 수 (10개 이상, 또는 전체의 1% 이상)
+    MIN_BIN = max(10, int(0.01 * len(X_seg)))
+    dense_mask = counts >= MIN_BIN
+
+    # 3-4) 권장 구간 계산 (PDP 최저치+ε AND 충분한 표본수)
+    ymin = float(yy.min())
+    mask_good = (yy <= (ymin + EPS)) & dense_mask
+
+    good_lo, good_hi = None, None
+    if mask_good.any():
+        idx = np.where(mask_good)[0]
+        splits = np.where(np.diff(idx) != 1)[0] + 1
+        runs = np.split(idx, splits)
+        best = max(runs, key=len)   # 가장 긴 연속 구간 선택
+        good_lo, good_hi = xx[best[0]], xx[best[-1]]
+
+    # 3-5) 그래프에 권장 구간 표시
+    if good_lo is not None and good_hi is not None:
+        ax.axvspan(good_lo, good_hi, color="green", alpha=0.20,
+                   label=f"권장 구간 {good_lo:.2f} ≤ x ≤ {good_hi:.2f}")
+
+    ax.set_title(f"mold_code {TARGET_MOLD} — PDP: {TARGET_FEATURE} (+ 권장 구간)", pad=16)
+    ax.set_ylabel("불량 확률 (predict_proba)")
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+
+    # -----------------------------
+    # 4. Actionable Insight 출력
+    # -----------------------------
+    print("📌 Actionable Insight")
+    if good_lo is not None and good_hi is not None:
+        print(f"- 권장 구간: {TARGET_FEATURE} {good_lo:.2f} ≤ x ≤ {good_hi:.2f}")
+        print(f"  (조건: PDP 최저치 + {EPS}, 표본 수 ≥ {MIN_BIN})")
+    else:
+        print(f"- 권장 구간: 없음 (표본 부족 또는 곡선이 평탄)")
